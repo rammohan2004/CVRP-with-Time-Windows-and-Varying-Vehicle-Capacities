@@ -53,6 +53,14 @@ SET="${1:-1000}"
 #     sbatch submit_solver.sh 10000 30        # angle 30
 ANGLE="${2:-180}"
 
+# Which algorithm version(s) to run. "all" runs 1, 2 and 3 in sequence
+# inside a single job, so the whole ablation comes from one queue slot and
+# one binary.
+#   sbatch submit_solver.sh 1000  180 all
+#   sbatch submit_solver.sh 10000  30 3
+VERSIONS="${3:-2}"
+if [ "${VERSIONS}" = "all" ]; then VERSIONS="1 2 3"; fi
+
 cd "$SLURM_SUBMIT_DIR"
 
 # No `module purge`: in the batch environment the module function points at
@@ -76,6 +84,7 @@ echo "host             : $(hostname)"
 echo "OMP_NUM_THREADS  : $OMP_NUM_THREADS"
 echo "instance set     : $SET"
 echo "sweep angle      : $ANGLE"
+echo "versions         : $VERSIONS"
 echo "libstdc++        : $(ldd ./solve_cvrptw 2>/dev/null | grep -o '/[^ ]*libstdc++[^ ]*' | head -1)"
 echo
 
@@ -104,7 +113,14 @@ if [ "$rc" -ne 0 ]; then
     # which is what we want: the binary loads and executes.
 fi
 
-bash run_solver.sh "${SET}" "outputs/${SET}" "${ANGLE}"
+status=0
+for V in ${VERSIONS}; do
+    echo
+    echo "################ VERSION ${V} ################"
+    bash run_solver.sh "${SET}" "outputs/${SET}_v${V}" "${ANGLE}" "${V}"
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then status=${rc}; fi
+done
 status=$?
 
 if [ "${status}" -ne 0 ]; then

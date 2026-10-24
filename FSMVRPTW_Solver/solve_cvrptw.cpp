@@ -10,6 +10,7 @@
 #include "lib/clark/clarke_wright.h"
 #include "lib/cluster/clustering.h"
 #include "lib/optim/consolidation.h"
+#include "lib/optim/downgrade.h"
 #include "lib/optim/inter_route_optimization.h"
 #include "lib/optim/intra_route_optimization.h"
 #include "lib/route_utils.h"
@@ -20,12 +21,25 @@ using namespace std;
 int main(int argc, char *argv[]) {
   VRP vrp;
   if (argc < 3) {
-    cout << "seqFSMVRPTW version 1" << '\n';
-    cout << "Usage: " << argv[0] << " instance.txt angle_range [results.csv]"
+    cout << "seqFSMVRPTW" << '\n';
+    cout << "Usage: " << argv[0]
+         << " instance.txt angle_range [results.csv] [version]" << '\n';
+    cout << "  version 1 = base: FSMVRPTW objective + fleet-aware moves only"
          << '\n';
+    cout << "  version 2 = 1 + route elimination        (default)" << '\n';
+    cout << "  version 3 = 2 + vehicle-type downgrade" << '\n';
     exit(1);
   }
   const string csv_path = (argc > 3) ? argv[3] : "solver_results.csv";
+
+  // Three versions from ONE build, rather than three copies of the tree. Copies
+  // drift -- a fix lands in one and not the others, and the ablation then
+  // compares different code instead of different operators.
+  const int version = (argc > 4) ? atoi(argv[4]) : 2;
+  if (version < 1 || version > 3) {
+    cerr << "version must be 1, 2 or 3" << endl;
+    exit(1);
+  }
 
   vrp.read(argv[1]);
   vrp.cal_dist();
@@ -138,23 +152,49 @@ int main(int argc, char *argv[]) {
   // ~0.014 s per call against a budget measured in seconds, so the loop is
   // effectively free.
   chrono::steady_clock::time_point consol_start = chrono::steady_clock::now();
-  // Built once for the whole instance, not once per round: it depends only on
-  // the instance geometry, and rebuilding it is O(n^2) each time.
-  const vector<vector<node_t>> knn = build_neighbour_lists(vrp, 30);
-  for (int round = 0; round < 10; ++round) {
-    if (!consolidate_routes(vrp, best_routes, knn)) {
-      break;  // nothing left to eliminate; further tidying will not change that
-    }
-#ifdef USE_PARALLEL
-    inter_route_relocate_parallel(vrp, best_routes);
-    inter_route_2opt_star_parallel(vrp, best_routes);
-#else
-    inter_route_relocate(vrp, best_routes);
-    inter_route_2opt_star(vrp, best_routes);
-#endif
+
+  // Neighbour lists are shared by BOTH consolidation and downgrade: they depend
+  // only on the instance, and building them is O(n^2), so once per instance.
+  // Skipped entirely for version 1, which uses neither operator.
+  vector<vector<node_t>> knn;
+  if (version >= 2) {
+    knn = build_neighbour_lists(vrp, 30);
   }
+
+  if (version >= 2) {
+    for (int round = 0; round < 10; ++round) {
+      if (!consolidate_routes(vrp, best_routes, knn)) {
+        break;  // nothing left to eliminate; tidying will not change that
+      }
+#ifdef USE_PARALLEL
+      inter_route_relocate_parallel(vrp, best_routes);
+      inter_route_2opt_star_parallel(vrp, best_routes);
+#else
+      inter_route_relocate(vrp, best_routes);
+      inter_route_2opt_star(vrp, best_routes);
+#endif
+    }
+  }
+  weight_t post_elimination_cost = calculate_total_cost(vrp, best_routes);
+
+  // Downgrade runs AFTER elimination, deliberately. A downgrade fills receiving
+  // routes; done first it can fill them past the point where another route's
+  // customers could have been redistributed, spending a ~55 gain to block a
+  // ~1500 one. Eliminate while routes still have slack, then downgrade the
+  // survivors.
+  if (version >= 3) {
+    for (int round = 0; round < 10; ++round) {
+      if (!downgrade_vehicle_types(vrp, best_routes, knn)) break;
+#ifdef USE_PARALLEL
+      inter_route_relocate_parallel(vrp, best_routes);
+#else
+      inter_route_relocate(vrp, best_routes);
+#endif
+    }
+  }
+
   chrono::steady_clock::time_point consol_end = chrono::steady_clock::now();
-  weight_t post_consolidation_cost = calculate_total_cost(vrp, best_routes);
+  weight_t post_downgrade_cost = calculate_total_cost(vrp, best_routes);
 
   chrono::steady_clock::time_point post_end = chrono::steady_clock::now();
   chrono::steady_clock::time_point total_end = chrono::steady_clock::now();
@@ -216,7 +256,9 @@ int main(int argc, char *argv[]) {
   cerr << "Post_Swap_Cost: " << post_swap_cost << " ";
   cerr << "Post_2opt_star_Cost: " << post_2opt_star_cost << " ";
   cerr << "Intra_Route_Optimization_Cost: " << post_process_it_cost << " ";
-  cerr << "Post_Consolidation_Cost: " << post_consolidation_cost << " ";
+  cerr << "Version: " << version << " ";
+  cerr << "Post_Elimination_Cost: " << post_elimination_cost << " ";
+  cerr << "Post_Downgrade_Cost: " << post_downgrade_cost << " ";
   cerr << "Consolidation_Time: "
        << static_cast<double>(
               chrono::duration_cast<chrono::nanoseconds>(consol_end -
@@ -269,7 +311,7 @@ int main(int argc, char *argv[]) {
       return all_ok ? 0 : 1;
     }
     if (csv.tellp() == 0) {
-      csv << "instance,n_customers,n_types,capacities,fixed_costs,"
+      csv << "instance,version,n_customers,n_types,capacities,fixed_costs,"
              "total_cost,routing_cost,fixed_cost,vehicles_used,mix,";
       for (size_t k = 0; k < vrp.numTypes(); ++k) {
         csv << "used_" << vrp.types()[k].letter << ',';
@@ -277,7 +319,8 @@ int main(int argc, char *argv[]) {
       csv << "solve_time_s,routing_cost_check,cost_split_check,"
              "customers_covered,feasible\n";
     }
-    csv << argv[1] << ',' << vrp.getSize() - 1 << ',' << vrp.numTypes() << ','
+    csv << argv[1] << ',' << version << ',' << vrp.getSize() - 1 << ','
+        << vrp.numTypes() << ','
         << caps.str() << ',' << fixes.str() << ',' << total << ',' << routing
         << ',' << fixed << ',' << used << ',' << mix_string(vrp, best_routes)
         << ',';

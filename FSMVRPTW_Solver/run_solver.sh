@@ -21,7 +21,7 @@ else
     IN="${SET}"
     TAG="$(basename "${SET}")"
 fi
-OUTDIR="${2:-outputs/${TAG}}"
+OUTDIR="${2:-outputs/${TAG}_v${4:-2}}"
 # 180, per Dinesh's observation that it beats every other angle -- confirmed here
 # on R2_10_1_a, where cost and vehicle count improve monotonically with angle:
 #   30 deg (12 clusters) 40 veh / 103568   120 deg (3) 29 veh /  99710
@@ -32,6 +32,11 @@ OUTDIR="${2:-outputs/${TAG}}"
 # NB: results at different angles are not comparable, so changing this
 # invalidates earlier baselines.
 ANGLE="${3:-180}"
+
+# Algorithm version: 1 = base, 2 = + route elimination, 3 = + vehicle
+# downgrade. One build serves all three (see solve_cvrptw.cpp), so the
+# ablation compares operators rather than three drifting copies of the tree.
+VERSION="${4:-2}"
 
 if [ ! -d "${IN}" ]; then
     echo "ERROR: ${IN} not found" >&2
@@ -63,6 +68,7 @@ CSV="${OUTDIR}/results.csv"
 
 echo "Instances : ${IN}  ($(ls "${IN}" | wc -l) files)"
 echo "Angle     : ${ANGLE}"
+echo "Version   : ${VERSION}"
 echo "Output    : ${OUTDIR}"
 echo
 
@@ -73,7 +79,7 @@ failed=0
 for infile in "${IN}"/*.txt; do
     name="$(basename "${infile}" .txt)"
     echo -n "  ${name}"
-    if ./solve_cvrptw "${infile}" "${ANGLE}" "${CSV}" \
+    if ./solve_cvrptw "${infile}" "${ANGLE}" "${CSV}" "${VERSION}" \
             > "${OUTDIR}/${name}.out" 2>> "${RESULTS}"; then
         echo ""
     else
